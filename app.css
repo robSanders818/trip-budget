@@ -87,8 +87,11 @@ label.field > span { display: block; font-size: 13px; color: var(--muted); margi
   width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg);
 }
 .field textarea { min-height: 80px; resize: vertical; }
-.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.two input[type=date] { min-width: 0; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.two > * { min-width: 0; }
+/* iOS gives date inputs a wide intrinsic width; strip native styling so they fit their column. */
+input[type=date] { -webkit-appearance: none; appearance: none; display: block; min-width: 0; max-width: 100%; min-height: 44px; text-align: left; }
+input[type=date]::-webkit-date-and-time-value { text-align: left; margin: 0; }
 .toggle { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 12px; }
 .toggle input { width: 22px; height: 22px; accent-color: var(--accent); }
 
