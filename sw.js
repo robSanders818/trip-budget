@@ -1,9 +1,10 @@
 // Offline support: always try GitHub for the newest files, fall back to the saved copy
 // when offline or when the network is too slow.
-const CACHE = 'tripbudget-v2';
+const CACHE = 'tripbudget-v3';
 const NETWORK_TIMEOUT_MS = 3000;
 const ASSETS = ['./', './index.html', './app.css', './app.js', './manifest.webmanifest',
-  './icons/icon-180.png', './icons/icon-512.png'];
+  './icons/icon-180.png', './icons/icon-512.png',
+  './vendor/pdfjs/pdf.min.js', './vendor/pdfjs/pdf.worker.min.js'];
 
 self.addEventListener('install', e => {
   // cache: 'reload' skips the phone's HTTP cache so a new install never saves stale files.

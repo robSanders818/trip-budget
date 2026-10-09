@@ -5,12 +5,14 @@
 let dbPromise;
 function openDb() {
   return dbPromise ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open('tripbudget', 1);
+    const req = indexedDB.open('tripbudget', 2);
     req.onupgradeneeded = () => {
-      req.result.createObjectStore('trips', { keyPath: 'id' });
-      req.result.createObjectStore('images'); // key: image id, value: { type, buf }
+      const db = req.result;
+      if (!db.objectStoreNames.contains('trips')) db.createObjectStore('trips', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('images')) db.createObjectStore('images'); // key: file id, value: { type, buf }
+      if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings'); // key: setting name
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => { req.result.onversionchange = () => req.result.close(); resolve(req.result); };
     req.onerror = () => reject(req.error);
   });
 }
@@ -31,6 +33,8 @@ const idb = {
   putImg: (id, val) => tx('images', 'readwrite', s => s.put(val, id)),
   delImg: id => tx('images', 'readwrite', s => s.delete(id)),
   imgKeys: () => tx('images', 'readonly', s => s.getAllKeys()),
+  setting: key => tx('settings', 'readonly', s => s.get(key)),
+  putSetting: (key, val) => tx('settings', 'readwrite', s => s.put(val, key)),
 };
 
 let trips = [];
@@ -84,6 +88,38 @@ function short(v, cur) {
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'MXN', 'JPY', 'AUD', 'NZD', 'CHF', 'CNY', 'KRW', 'THB', 'VND', 'INR', 'BRL', 'COP', 'PEN', 'CRC', 'ISK', 'NOK', 'SEK', 'DKK', 'CZK', 'HUF', 'PLN', 'TRY', 'ZAR', 'SGD', 'HKD', 'TWD', 'PHP', 'IDR', 'MYR', 'AED', 'MAD', 'EGP'];
 
+/* ================= Currencies ================= */
+
+let curNamer = null;
+try { curNamer = new Intl.DisplayNames(undefined, { type: 'currency' }); } catch { /* older iOS: codes only */ }
+const curName = c => { try { return curNamer?.of(c) || c; } catch { return c; } };
+// Every current ISO currency the phone knows a name for (skips retired ones like "… (1990–2002)" and metals/test codes).
+const ALL_CURRENCIES = (() => {
+  let codes = [];
+  try { codes = Intl.supportedValuesOf('currency'); } catch { /* not supported */ }
+  if (!codes.length) return CURRENCIES;
+  return codes.filter(c => (!c.startsWith('X') || ['XAF', 'XOF', 'XPF', 'XCD'].includes(c))
+    && (CURRENCIES.includes(c) || (curName(c) !== c && !/\(\d{4}/.test(curName(c)))));
+})();
+
+// The user's chosen currencies (Home screen). Dropdowns only offer these, and only their rates are kept.
+let myCurrencies = ['USD'];
+async function loadMyCurrencies() {
+  const saved = await idb.setting('currencies');
+  if (saved?.length) { myCurrencies = saved; return; }
+  // First run: start with USD plus anything already used in trips.
+  const used = trips.flatMap(t => [t.currency, ...[...t.flights, ...t.hotels].map(b => b.fx?.cur),
+    ...Object.values(t.days).flatMap(d => LIST_CATS.flatMap(c => (d[c.key] || []).map(i => i.fx?.cur)))]);
+  myCurrencies = [...new Set(['USD', ...used.filter(Boolean)])];
+}
+function saveMyCurrencies() { return idb.putSetting('currencies', myCurrencies); }
+// Chosen currencies plus any still referenced by trips, so conversions never lose a rate they need.
+function neededCurrencies() {
+  return new Set(['USD', ...myCurrencies, ...trips.flatMap(t => [t.currency,
+    ...[...t.flights, ...t.hotels].map(b => b.fx?.cur),
+    ...Object.values(t.days).flatMap(d => LIST_CATS.flatMap(c => (d[c.key] || []).map(i => i.fx?.cur)))])].filter(Boolean));
+}
+
 /* ================= Exchange rates ================= */
 
 // Daily rates (per 1 USD) from open.er-api.com, with a jsDelivr-hosted mirror as backup.
@@ -101,11 +137,16 @@ const RATE_SOURCES = [
     return { rates: Object.fromEntries(Object.entries(d.usd).map(([k, v]) => [k.toUpperCase(), v])), date: d.date, source: 'currency-api (jsDelivr)' };
   },
 ];
+// The free services only offer one combined download; we keep just the currencies you use.
 async function refreshRates(force = false) {
-  if (!force && rates && Date.now() - rates.fetched < 6 * 36e5) return rates;
+  const need = neededCurrencies();
+  const missing = [...need].some(c => !rates?.rates?.[c]);
+  if (!force && !missing && rates && Date.now() - rates.fetched < 6 * 36e5) return rates;
   for (const src of RATE_SOURCES) {
     try {
-      rates = { ...(await src(AbortSignal.timeout?.(6000))), fetched: Date.now() };
+      const got = await src(AbortSignal.timeout?.(6000));
+      got.rates = Object.fromEntries(Object.entries(got.rates).filter(([c]) => need.has(c)));
+      rates = { ...got, fetched: Date.now() };
       try { localStorage.setItem(RATES_KEY, JSON.stringify(rates)); } catch { /* storage unavailable */ }
       return rates;
     } catch { /* try the next source */ }
@@ -136,9 +177,9 @@ function setMoney(o, key, amt, cur, tripCur, rate) {
   if (cur === tripCur) { o[key] = amt; delete o.fx; }
   else { o.fx = { amt, cur, rate }; o[key] = round2(amt * rate); }
 }
-const allCurrencies = () => [...new Set([...CURRENCIES, ...Object.keys(rates?.rates || {}).sort()])];
 function curOptions(trip, selected) {
-  const list = [...new Set([trip.currency, ...(trip.recentCurs || []), ...allCurrencies()])];
+  const mine = new Set(myCurrencies);
+  const list = [...new Set([trip.currency, ...(trip.recentCurs || []).filter(c => mine.has(c)), ...myCurrencies, selected])];
   return list.map(c => `<option ${c === selected ? 'selected' : ''}>${c}</option>`).join('');
 }
 function rememberCur(trip, c) {
@@ -293,7 +334,7 @@ const fromB64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0)).buffer;
 async function exportBackup() {
   const images = {};
   for (const k of await idb.imgKeys()) { const r = await idb.img(k); images[k] = { type: r.type, data: toB64(r.buf) }; }
-  const json = JSON.stringify({ app: 'tripbudget', v: 1, exported: new Date().toISOString(), trips, images });
+  const json = JSON.stringify({ app: 'tripbudget', v: 1, exported: new Date().toISOString(), trips, images, currencies: myCurrencies });
   let blob = new Blob([json], { type: 'application/json' });
   let ext = 'json';
   if ('CompressionStream' in window) {
@@ -321,6 +362,7 @@ async function importBackup(file) {
   if (!confirm(`Import ${data.trips.length} trip(s)? Trips with the same ID will be replaced.`)) return;
   for (const [k, v] of Object.entries(data.images || {})) await idb.putImg(k, { type: v.type, buf: fromB64(v.data) });
   for (const t of data.trips) await idb.putTrip(migrate(t));
+  if (data.currencies?.length) { myCurrencies = [...new Set([...myCurrencies, ...data.currencies])]; await saveMyCurrencies(); }
   trips = await idb.trips();
   render();
 }
@@ -343,7 +385,14 @@ function viewHome() {
       <div class="meta"><span>${rangeLabel(t.start, t.end)}</span><span class="num">${money(tot.total, t.currency)}${t.budget ? ` / ${money(t.budget, t.currency, false)}` : ''}</span></div>
     </a>`;
   }).join('') : `<div class="empty">No trips yet.<br><br><a class="btn" href="#new">Add a trip</a></div>`) + `
-    <div class="card foot">
+    <div class="card foot" id="cur-card">
+      <h2>My currencies <button class="link" data-act="rates">Refresh rates</button></h2>
+      <div class="chips" id="cur-chips"></div>
+      <input id="cur-search" class="search" placeholder="Add a currency: search name or code" autocomplete="off" autocapitalize="off">
+      <div id="cur-results" class="cur-results"></div>
+      <div class="small muted" id="rates-info" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
       <h2>Backup</h2>
       <p class="small muted" style="margin-top:0">Everything is stored only on this phone. Export a backup to Files or iCloud Drive now and then. Deleting the app from your Home Screen erases its data.</p>
       <div class="row-btns">
@@ -351,17 +400,39 @@ function viewHome() {
         <label class="btn secondary">Import<input type="file" accept=".gz,.json,application/json,application/gzip" hidden data-act="import"></label>
       </div>
       <div class="small muted" id="usage"></div>
-    </div>
-    <div class="card">
-      <h2>Exchange rates <button class="link" data-act="rates">Refresh</button></h2>
-      <div class="small muted" id="rates-info"></div>
     </div>`;
   const showRates = () => {
     $('#rates-info').innerHTML = rates
-      ? `Updated ${esc(rates.date)} · ${Object.keys(rates.rates).length} currencies · <a href="https://www.exchangerate-api.com" target="_blank">Rates by Exchange Rate API</a>`
-      : 'Not downloaded yet. Rates download automatically when you\'re online.';
+      ? `Rates updated ${esc(rates.date)} · <a href="https://www.exchangerate-api.com" target="_blank">Rates by Exchange Rate API</a>`
+      : 'Rates not downloaded yet. They download automatically when you\'re online.';
   };
-  showRates();
+  const usdRate = c => { const r = fxRate(c, 'USD'); return c === 'USD' || !r ? '' : `1 ${c} = $${fmtRate(r)}`; };
+  const showChips = () => {
+    $('#cur-chips').innerHTML = myCurrencies.map(c => `
+      <span class="chip"><b>${c}</b><span>${esc(curName(c))}<small class="num">${usdRate(c)}</small></span>
+      ${myCurrencies.length > 1 ? `<button data-rm-cur="${c}" aria-label="Remove ${c}">×</button>` : ''}</span>`).join('');
+  };
+  const showResults = () => {
+    const q = $('#cur-search').value.trim().toLowerCase();
+    if (!q) { $('#cur-results').innerHTML = ''; return; }
+    const hits = ALL_CURRENCIES.filter(c => !myCurrencies.includes(c)
+      && (c.toLowerCase().startsWith(q) || curName(c).toLowerCase().includes(q))).slice(0, 8);
+    $('#cur-results').innerHTML = hits.length
+      ? hits.map(c => `<button data-add-cur="${c}"><b>${c}</b> ${esc(curName(c))}</button>`).join('')
+      : '<div class="small muted">No matching currency.</div>';
+  };
+  showRates(); showChips();
+  $('#cur-search').oninput = showResults;
+  $('#cur-card').addEventListener('click', async e => {
+    const add = e.target.closest('[data-add-cur]')?.dataset.addCur;
+    const rm = e.target.closest('[data-rm-cur]')?.dataset.rmCur;
+    if (!add && !rm) return;
+    myCurrencies = add ? [...myCurrencies, add] : myCurrencies.filter(c => c !== rm);
+    await saveMyCurrencies();
+    if (add) { $('#cur-search').value = ''; showResults(); }
+    showChips();
+    if (add) { await refreshRates(); showChips(); showRates(); }
+  });
   $('[data-act=rates]').onclick = async e => {
     e.target.textContent = 'Updating…';
     const before = rates?.fetched;
@@ -388,7 +459,7 @@ function viewTripForm(trip, isNew) {
         <label class="field"><span>Last day</span><input type="date" name="end" value="${draft.end}"></label>
       </div>
       <div class="two">
-        <label class="field"><span>Show totals in</span><select name="currency">${allCurrencies().map(c => `<option ${c === draft.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+        <label class="field"><span>Show totals in</span><select name="currency">${[...new Set([draft.currency, ...myCurrencies])].map(c => `<option value="${c}" ${c === draft.currency ? 'selected' : ''}>${c} – ${esc(curName(c))}</option>`).join('')}</select></label>
         <label class="field"><span>Total budget (optional)</span><input name="budget" inputmode="decimal" value="${draft.budget ?? ''}" placeholder="None"></label>
       </div>
     </div>
@@ -728,16 +799,68 @@ async function viewBooking(trip, kind, id, params) {
   });
 }
 
+// PDF.js (vendored in /vendor/pdfjs) renders every page; iOS's built-in PDF preview only shows page one.
+let pdfjsPromise;
+const loadPdfJs = () => pdfjsPromise ??= import('./vendor/pdfjs/pdf.min.js').then(m => {
+  m.GlobalWorkerOptions.workerSrc = new URL('vendor/pdfjs/pdf.worker.min.js', location.href).href;
+  return m;
+});
+let viewerToken = 0;
+let viewerUrls = [];
+// Render each page to a compressed image (not a live canvas) so long PDFs don't exhaust iPhone memory.
+async function renderPdf(buf, box, token) {
+  const pdfjs = await loadPdfJs();
+  const task = pdfjs.getDocument({ data: new Uint8Array(buf.slice(0)) });
+  const doc = await task.promise;
+  try {
+    if (token !== viewerToken) return; // viewer closed or another file opened while loading
+    box.innerHTML = '';
+    const scale = Math.min(window.devicePixelRatio || 1, 3) * 1.25; // a bit extra so pinch-zoomed text stays sharp
+    for (let i = 1; i <= doc.numPages && token === viewerToken; i++) {
+      const page = await doc.getPage(i);
+      const base = page.getViewport({ scale: 1 });
+      // iOS Safari refuses canvases over ~16.7 MP, so cap each page at 10 MP.
+      const want = (box.clientWidth / base.width) * scale;
+      const vp = page.getViewport({ scale: Math.min(want, Math.sqrt(10e6 / (base.width * base.height))) });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(vp.width); canvas.height = Math.floor(vp.height);
+      // 'print' renders straight through instead of waiting on animation frames (pages are drawn off-screen anyway).
+      await page.render({ canvas, canvasContext: canvas.getContext('2d'), viewport: vp, intent: 'print' }).promise;
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.88));
+      canvas.width = canvas.height = 0;
+      page.cleanup();
+      if (token !== viewerToken) break;
+      const url = URL.createObjectURL(blob);
+      viewerUrls.push(url);
+      box.insertAdjacentHTML('beforeend', `<img class="pdf-page" src="${url}" alt="Page ${i} of ${doc.numPages}">`);
+    }
+  } finally {
+    task.destroy().catch(() => {}); // frees the worker's copy of the PDF
+  }
+}
+
 async function openViewer(f) {
   const url = await fileUrl(f.id);
   if (!url) return alert('That file is missing.');
+  const token = ++viewerToken;
   const v = $('#viewer'), body = $('.viewer-body', v);
   $('.viewer-name', v).textContent = f.name;
+  body.classList.toggle('pdf', f.type === 'application/pdf');
   body.innerHTML = f.type.startsWith('image/') ? `<img src="${url}" alt="">`
-    : f.type === 'application/pdf' ? `<iframe src="${url}" title="${esc(f.name)}"></iframe>`
-    : '<div class="empty">No preview for this file type.<br>Tap Share to open it in another app.</div>';
+    : f.type === 'application/pdf' ? '<div class="empty">Loading PDF…</div>'
+    : '<div class="empty">No preview for this file type.<br>Tap “Open in…” to save it to Files or open it in another app.</div>';
   v.hidden = false;
-  $('[data-v=close]', v).onclick = () => { v.hidden = true; body.innerHTML = ''; };
+  if (f.type === 'application/pdf') {
+    const rec = await idb.img(f.id);
+    renderPdf(rec.buf, body, token).catch(() => {
+      if (token === viewerToken) body.innerHTML = '<div class="empty">Couldn’t display this PDF.<br>Tap “Open in…” to view it in Files or Books.</div>';
+    });
+  }
+  $('[data-v=close]', v).onclick = () => {
+    viewerToken++;
+    v.hidden = true; body.innerHTML = '';
+    viewerUrls.forEach(URL.revokeObjectURL); viewerUrls = [];
+  };
   $('[data-v=share]', v).onclick = async () => {
     const rec = await idb.img(f.id);
     const file = new File([rec.buf], f.name, { type: rec.type });
@@ -779,6 +902,7 @@ window.addEventListener('hashchange', render);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   navigator.storage?.persist?.();
   trips = (await idb.trips()).map(migrate);
+  await loadMyCurrencies();
   render();
   cleanupImages();
   // Rates arrive after first paint; redraw the home screen so its "updated" line is current.
