@@ -84,6 +84,88 @@ function short(v, cur) {
 
 const CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'MXN', 'JPY', 'AUD', 'NZD', 'CHF', 'CNY', 'KRW', 'THB', 'VND', 'INR', 'BRL', 'COP', 'PEN', 'CRC', 'ISK', 'NOK', 'SEK', 'DKK', 'CZK', 'HUF', 'PLN', 'TRY', 'ZAR', 'SGD', 'HKD', 'TWD', 'PHP', 'IDR', 'MYR', 'AED', 'MAD', 'EGP'];
 
+/* ================= Exchange rates ================= */
+
+// Daily rates (per 1 USD) from open.er-api.com, with a jsDelivr-hosted mirror as backup.
+// Cached on the phone so conversions still work offline.
+const RATES_KEY = 'fx-rates-v1';
+let rates = (() => { try { return JSON.parse(localStorage.getItem(RATES_KEY)); } catch { return null; } })();
+const RATE_SOURCES = [
+  async signal => {
+    const d = await (await fetch('https://open.er-api.com/v6/latest/USD', { signal })).json();
+    if (d.result !== 'success') throw new Error('bad response');
+    return { rates: d.rates, date: new Date(d.time_last_update_unix * 1000).toISOString().slice(0, 10), source: 'open.er-api.com' };
+  },
+  async signal => {
+    const d = await (await fetch('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', { signal })).json();
+    return { rates: Object.fromEntries(Object.entries(d.usd).map(([k, v]) => [k.toUpperCase(), v])), date: d.date, source: 'currency-api (jsDelivr)' };
+  },
+];
+async function refreshRates(force = false) {
+  if (!force && rates && Date.now() - rates.fetched < 6 * 36e5) return rates;
+  for (const src of RATE_SOURCES) {
+    try {
+      rates = { ...(await src(AbortSignal.timeout?.(6000))), fetched: Date.now() };
+      try { localStorage.setItem(RATES_KEY, JSON.stringify(rates)); } catch { /* storage unavailable */ }
+      return rates;
+    } catch { /* try the next source */ }
+  }
+  return rates;
+}
+// How many `to` one `from` buys, from cached rates; null if unknown.
+function fxRate(from, to) {
+  if (from === to) return 1;
+  const a = rates?.rates?.[from], b = rates?.rates?.[to];
+  return a && b ? b / a : null;
+}
+// Like fxRate, but tries the network and finally asks the user.
+async function rateFor(from, to) {
+  if (from === to) return 1;
+  if (!fxRate(from, to)) await refreshRates(true);
+  const r = fxRate(from, to);
+  if (r) return r;
+  const typed = num(prompt(`Couldn't get an exchange rate (offline?).\nHow many ${to} is 1 ${from}?`) ?? '');
+  return typed > 0 ? typed : null;
+}
+const fmtRate = r => r >= 100 ? r.toFixed(2) : String(Number(r.toPrecision(4)));
+const round2 = n => Math.round(n * 100) / 100;
+
+// `amount`/`price` is always in the trip currency. Foreign entries also keep the original
+// amount, currency and the rate used at entry time in `fx`, so totals never drift.
+function setMoney(o, key, amt, cur, tripCur, rate) {
+  if (cur === tripCur) { o[key] = amt; delete o.fx; }
+  else { o.fx = { amt, cur, rate }; o[key] = round2(amt * rate); }
+}
+const allCurrencies = () => [...new Set([...CURRENCIES, ...Object.keys(rates?.rates || {}).sort()])];
+function curOptions(trip, selected) {
+  const list = [...new Set([trip.currency, ...(trip.recentCurs || []), ...allCurrencies()])];
+  return list.map(c => `<option ${c === selected ? 'selected' : ''}>${c}</option>`).join('');
+}
+function rememberCur(trip, c) {
+  trip.lastCur = c;
+  if (c !== trip.currency) trip.recentCurs = [c, ...(trip.recentCurs || []).filter(x => x !== c)].slice(0, 4);
+}
+
+// Re-express every amount in a new trip currency, keeping originals in `fx`. Returns false if a rate is missing.
+async function changeTripCurrency(trip, to) {
+  const from = trip.currency;
+  const entries = [
+    ...[...trip.flights, ...trip.hotels].map(b => [b, 'price']),
+    ...Object.values(trip.days).flatMap(d => LIST_CATS.flatMap(c => (d[c.key] || []).map(i => [i, 'amount']))),
+  ];
+  const need = new Set([from, ...entries.map(([o]) => o.fx?.cur).filter(Boolean)]);
+  const r = {};
+  for (const c of need) if (!(r[c] = await rateFor(c, to))) return false;
+  for (const [o, k] of entries) {
+    const cur = o.fx ? o.fx.cur : from;
+    setMoney(o, k, o.fx ? o.fx.amt : o[k] || 0, cur, to, r[cur]);
+  }
+  if (trip.budget) trip.budget = Math.round(trip.budget * r[from]);
+  trip.currency = to;
+  if (trip.lastCur === to) trip.lastCur = null;
+  return true;
+}
+
 const CATS = [
   { key: 'flights', label: 'Flights', head: 'Flight' },
   { key: 'hotel', label: 'Hotel', head: 'Hotel' },
@@ -98,6 +180,14 @@ const LIST_CATS = CATS.filter(c => c.list);
 function newTrip() {
   const start = today();
   return { id: uid(), name: '', start, end: addDays(start, 6), currency: 'USD', budget: null, days: {}, flights: [], hotels: [] };
+}
+// Older versions stored one screenshot per booking as `receipt`; it's now a `files` list.
+function migrate(trip) {
+  for (const b of [...trip.flights, ...trip.hotels]) {
+    b.files ??= b.receipt ? [{ id: b.receipt, name: 'Receipt.jpg', type: 'image/jpeg' }] : [];
+    delete b.receipt;
+  }
+  return trip;
 }
 function getDay(trip, date) {
   return trip.days[date] ??= { city: '', notes: '', food: [], ent: [], misc: [] };
@@ -149,7 +239,7 @@ function heat(v, max) {
   return `background:hsl(${hue} 75% var(--heat-l) / calc(var(--heat-a0) + (var(--heat-a1) - var(--heat-a0)) * ${r.toFixed(2)}))`;
 }
 
-/* ================= Images ================= */
+/* ================= Files ================= */
 
 // Downscale + JPEG-compress photos so receipts stay ~100–250 KB.
 async function compressImage(file, maxDim = 1500, quality = 0.62) {
@@ -167,17 +257,31 @@ async function compressImage(file, maxDim = 1500, quality = 0.62) {
     URL.revokeObjectURL(url);
   }
 }
+// Photos are compressed; anything else (PDFs, etc.) is stored as-is. Returns the file's metadata.
+async function storeFile(file) {
+  let rec = null;
+  if (file.type.startsWith('image/') && file.type !== 'image/gif') {
+    try { rec = await compressImage(file); } catch { /* undecodable image: keep the original */ }
+  }
+  rec ??= { type: file.type || 'application/octet-stream', buf: await file.arrayBuffer() };
+  const id = uid();
+  await idb.putImg(id, rec);
+  let name = file.name || 'File';
+  if (rec.type === 'image/jpeg' && !/\.jpe?g$/i.test(name)) name = name.replace(/\.[^.]+$/, '') + '.jpg';
+  return { id, name, type: rec.type, size: rec.buf.byteLength };
+}
+const fmtSize = n => n == null ? '' : n < 1048576 ? `${Math.max(1, Math.round(n / 1024))} KB` : `${(n / 1048576).toFixed(1)} MB`;
 const imgUrls = {};
-async function imageUrl(id) {
+async function fileUrl(id) {
   if (!id) return null;
   if (imgUrls[id]) return imgUrls[id];
   const rec = await idb.img(id);
   if (!rec) return null;
   return imgUrls[id] = URL.createObjectURL(new Blob([rec.buf], { type: rec.type }));
 }
-// Remove stored images no longer referenced by any trip (e.g. replaced or cancelled drafts).
+// Remove stored files no longer referenced by any trip (e.g. removed or cancelled drafts).
 async function cleanupImages() {
-  const used = new Set(trips.flatMap(t => [...t.flights, ...t.hotels].map(b => b.receipt).filter(Boolean)));
+  const used = new Set(trips.flatMap(t => [...t.flights, ...t.hotels].flatMap(b => (b.files || []).map(f => f.id))));
   for (const k of await idb.imgKeys()) if (!used.has(k)) await idb.delImg(k);
 }
 
@@ -216,7 +320,7 @@ async function importBackup(file) {
   if (data.app !== 'tripbudget' || !Array.isArray(data.trips)) throw new Error('Not a Trip Budget backup');
   if (!confirm(`Import ${data.trips.length} trip(s)? Trips with the same ID will be replaced.`)) return;
   for (const [k, v] of Object.entries(data.images || {})) await idb.putImg(k, { type: v.type, buf: fromB64(v.data) });
-  for (const t of data.trips) await idb.putTrip(t);
+  for (const t of data.trips) await idb.putTrip(migrate(t));
   trips = await idb.trips();
   render();
 }
@@ -247,7 +351,25 @@ function viewHome() {
         <label class="btn secondary">Import<input type="file" accept=".gz,.json,application/json,application/gzip" hidden data-act="import"></label>
       </div>
       <div class="small muted" id="usage"></div>
+    </div>
+    <div class="card">
+      <h2>Exchange rates <button class="link" data-act="rates">Refresh</button></h2>
+      <div class="small muted" id="rates-info"></div>
     </div>`;
+  const showRates = () => {
+    $('#rates-info').innerHTML = rates
+      ? `Updated ${esc(rates.date)} · ${Object.keys(rates.rates).length} currencies · <a href="https://www.exchangerate-api.com" target="_blank">Rates by Exchange Rate API</a>`
+      : 'Not downloaded yet. Rates download automatically when you\'re online.';
+  };
+  showRates();
+  $('[data-act=rates]').onclick = async e => {
+    e.target.textContent = 'Updating…';
+    const before = rates?.fetched;
+    await refreshRates(true);
+    e.target.textContent = 'Refresh';
+    if (rates?.fetched === before) alert('Couldn\'t reach the exchange rate service. Using saved rates.');
+    showRates();
+  };
   navigator.storage?.estimate?.().then(e => {
     const el = $('#usage'); if (el && e.usage != null) el.textContent = `Using ${(e.usage / 1048576).toFixed(1)} MB on this device`;
   });
@@ -266,7 +388,7 @@ function viewTripForm(trip, isNew) {
         <label class="field"><span>Last day</span><input type="date" name="end" value="${draft.end}"></label>
       </div>
       <div class="two">
-        <label class="field"><span>Currency</span><select name="currency">${CURRENCIES.map(c => `<option ${c === draft.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
+        <label class="field"><span>Show totals in</span><select name="currency">${allCurrencies().map(c => `<option ${c === draft.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
         <label class="field"><span>Total budget (optional)</span><input name="budget" inputmode="decimal" value="${draft.budget ?? ''}" placeholder="None"></label>
       </div>
     </div>
@@ -281,7 +403,14 @@ function viewTripForm(trip, isNew) {
     if (!f('start') || !f('end')) return alert('Pick the first and last day.');
     if (f('end') < f('start')) return alert('The last day must be on or after the first day.');
     if (daysBetween(f('start'), f('end')) > 365) return alert('Trips can be at most a year long.');
-    Object.assign(trip, { name: f('name').trim(), start: f('start'), end: f('end'), currency: f('currency'), budget: f('budget').trim() ? num(f('budget')) : null });
+    const budget = f('budget').trim() ? num(f('budget')) : null;
+    const budgetEdited = budget !== trip.budget;
+    if (!isNew && f('currency') !== trip.currency) {
+      if (!confirm(`Convert all of this trip's amounts from ${trip.currency} to ${f('currency')}? Original amounts are kept.`)) return;
+      if (!(await changeTripCurrency(trip, f('currency')))) return alert('Couldn\'t get exchange rates, so the currency wasn\'t changed.');
+    }
+    Object.assign(trip, { name: f('name').trim(), start: f('start'), end: f('end'), currency: f('currency') });
+    if (budgetEdited || isNew) trip.budget = budget;
     if (isNew) trips.push(trip);
     await saveNow(trip);
     location.replace(`#trip/${trip.id}`);
@@ -344,20 +473,22 @@ function viewTrip(trip) {
   app.querySelectorAll('tbody td').forEach(td => td.onclick = () => { location.hash = `#trip/${trip.id}/day/${td.dataset.day}`; });
 }
 
+const origLine = o => o.fx ? `<small>${money(o.fx.amt, o.fx.cur)}</small>` : '';
+const clip = b => b.files?.length ? ` <span class="muted small">📎${b.files.length}</span>` : '';
 function bookingRow(trip, b, kind) {
   const cur = trip.currency;
   if (kind === 'flight') {
     const route = [b.from, b.to].filter(Boolean).join(' → ');
     return `<a class="booking" href="#trip/${trip.id}/flight/${b.id}">
-      <div class="what"><b>✈︎ ${esc([b.airline, b.number].filter(Boolean).join(' ') || 'Flight')}</b>
+      <div class="what"><b>✈︎ ${esc([b.airline, b.number].filter(Boolean).join(' ') || 'Flight')}${clip(b)}</b>
       <span>${esc(route)}${route ? ' · ' : ''}${b.date ? dayLabel(b.date) : 'No date'}</span></div>
-      <span class="num">${money(b.price || 0, cur)}</span>
+      <span class="num amt-col">${money(b.price || 0, cur)}${origLine(b)}</span>
       <span class="pill ${b.booked ? 'ok' : 'todo'}">${b.booked ? 'Booked' : 'To book'}</span></a>`;
   }
   return `<a class="booking" href="#trip/${trip.id}/hotel/${b.id}">
-    <div class="what"><b>🛏 ${esc(b.name || 'Hotel')}</b>
+    <div class="what"><b>🛏 ${esc(b.name || 'Hotel')}${clip(b)}</b>
     <span>${b.checkIn ? `${dayLabel(b.checkIn)} → ${dayLabel(b.checkOut)} · ${nights(b)} night${nights(b) === 1 ? '' : 's'}` : 'No dates'}</span></div>
-    <span class="num">${money(b.price || 0, cur)}</span>
+    <span class="num amt-col">${money(b.price || 0, cur)}${origLine(b)}</span>
     <span class="pill ${b.booked ? 'ok' : 'todo'}">${b.booked ? 'Booked' : 'To book'}</span></a>`;
 }
 
@@ -380,18 +511,22 @@ function viewDay(trip, date) {
   const next = date < trip.end ? addDays(date, 1) : null;
   const dayNo = daysBetween(trip.start, date) + 1;
 
+  const fxLine = it => `= ${money(it.amount, cur)} · 1 ${it.fx.cur} = ${fmtRate(it.fx.rate)} ${cur}`;
   const listCard = c => `
     <div class="card" data-cat="${c.key}">
       <h2>${c.label} <span class="section-total">${money(sum(day[c.key].map(i => i.amount)), cur)}</span></h2>
       <ul class="items">${day[c.key].map(it => `
         <li data-id="${it.id}">
           <input class="label" value="${esc(it.label)}" placeholder="Description" data-f="label">
-          <input class="amt num" value="${it.amount}" inputmode="decimal" data-f="amount">
+          <input class="amt num" value="${it.fx ? it.fx.amt : it.amount}" inputmode="decimal" data-f="amount">
+          <span class="cur-tag">${it.fx ? it.fx.cur : cur}</span>
           <button class="del" aria-label="Remove">×</button>
+          ${it.fx ? `<button class="fx-line num" type="button">${fxLine(it)}</button>` : ''}
         </li>`).join('')}</ul>
       <form class="add-row">
         <input name="label" placeholder="${c.key === 'food' ? 'e.g. Ramen lunch' : c.key === 'ent' ? 'e.g. Museum tickets' : 'e.g. Metro card'}" autocomplete="off">
         <input name="amount" class="amt" placeholder="0.00" inputmode="decimal" autocomplete="off">
+        <select name="cur" class="cur" aria-label="Currency">${curOptions(trip, trip.lastCur || cur)}</select>
         <button class="btn">Add</button>
       </form>
     </div>`;
@@ -422,22 +557,37 @@ function viewDay(trip, date) {
       const li = e.target.closest('li'); if (!li) return;
       const it = list.find(i => i.id === li.dataset.id);
       if (e.target.dataset.f === 'label') it.label = e.target.value;
-      else { it.amount = num(e.target.value); updateTotal(); }
+      else if (e.target.dataset.f === 'amount') {
+        if (it.fx) { it.fx.amt = num(e.target.value); it.amount = round2(it.fx.amt * it.fx.rate); $('.fx-line', li).textContent = fxLine(it); }
+        else it.amount = num(e.target.value);
+        updateTotal();
+      }
       save(trip);
     });
     card.addEventListener('click', e => {
+      if (e.target.matches('.fx-line')) {
+        const it = list.find(i => i.id === e.target.closest('li').dataset.id);
+        const r = num(prompt(`Exchange rate used for this expense:\n1 ${it.fx.cur} = how many ${cur}?`, fmtRate(it.fx.rate)) ?? '');
+        if (r > 0) { it.fx.rate = r; it.amount = round2(it.fx.amt * r); e.target.textContent = fxLine(it); updateTotal(); save(trip, 0); }
+        return;
+      }
       if (!e.target.matches('.del')) return;
       const id = e.target.closest('li').dataset.id;
       list.splice(list.findIndex(i => i.id === id), 1);
       e.target.closest('li').remove();
       updateTotal(); save(trip, 0);
     });
-    $('form', card).onsubmit = e => {
+    $('form', card).onsubmit = async e => {
       e.preventDefault();
       const f = e.target;
-      const amount = num(f.amount.value);
+      const amount = num(f.amount.value), c = f.cur.value;
       if (!f.label.value.trim() && !amount) return;
-      list.push({ id: uid(), label: f.label.value.trim(), amount });
+      const rate = await rateFor(c, cur);
+      if (!rate) return;
+      const it = { id: uid(), label: f.label.value.trim() };
+      setMoney(it, 'amount', amount, c, cur, rate);
+      list.push(it);
+      rememberCur(trip, c);
       save(trip, 0);
       const y = scrollY;
       viewDay(trip, date);
@@ -453,21 +603,28 @@ async function viewBooking(trip, kind, id, params) {
   if (id !== 'new' && !existing) return location.replace(`#trip/${trip.id}`);
   const d = params.get('date') || trip.start;
   const draft = existing ? structuredClone(existing) : kind === 'flight'
-    ? { id: uid(), date: d, airline: '', number: '', from: '', to: '', price: 0, booked: false, receipt: null, notes: '' }
-    : { id: uid(), name: '', address: '', checkIn: d, checkOut: addDays(d, 1), price: 0, booked: false, receipt: null, notes: '' };
+    ? { id: uid(), date: d, airline: '', number: '', from: '', to: '', price: 0, booked: false, files: [], notes: '' }
+    : { id: uid(), name: '', address: '', checkIn: d, checkOut: addDays(d, 1), price: 0, booked: false, files: [], notes: '' };
   const backTo = params.get('date') ? `trip/${trip.id}/day/${params.get('date')}` : `trip/${trip.id}`;
+  const priceField = label => `
+      <label class="field"><span>${label}</span><div class="price-row">
+        <input name="price" value="${draft.fx ? draft.fx.amt : draft.price}" inputmode="decimal" autocomplete="off">
+        <select id="price-cur" aria-label="Currency">${curOptions(trip, draft.fx?.cur || trip.currency)}</select>
+      </div></label>
+      <div class="small muted num" id="fx-note" style="margin:-6px 0 12px"></div>`;
   const field = (name, label, attrs = '') => `<label class="field"><span>${label}</span><input name="${name}" value="${esc(draft[name])}" autocomplete="off" ${attrs}></label>`;
 
   const fields = kind === 'flight' ? `
       <div class="two">${field('airline', 'Airline', 'placeholder="e.g. United"')}${field('number', 'Flight #', 'placeholder="UA 837" autocapitalize="characters"')}</div>
       <div class="two">${field('from', 'From', 'placeholder="SFO" autocapitalize="characters"')}${field('to', 'To', 'placeholder="NRT" autocapitalize="characters"')}</div>
-      <div class="two">${field('date', 'Departure date', 'type="date"')}${field('price', 'Price', 'inputmode="decimal"')}</div>`
+      ${field('date', 'Departure date', 'type="date"')}
+      ${priceField('Price')}`
     : `
       ${field('name', 'Hotel name', 'placeholder="e.g. Hotel Gracery"')}
       <label class="field"><span>Address</span><textarea name="address" rows="2" style="min-height:0" placeholder="Street, city">${esc(draft.address)}</textarea></label>
       ${draft.address ? `<p style="margin:-6px 0 12px"><a href="https://maps.apple.com/?q=${encodeURIComponent(draft.address)}" target="_blank">Open in Maps ↗</a></p>` : ''}
       <div class="two">${field('checkIn', 'Check-in', 'type="date"')}${field('checkOut', 'Check-out', 'type="date"')}</div>
-      ${field('price', 'Total price (all nights)', 'inputmode="decimal"')}
+      ${priceField('Total price (all nights)')}
       <div class="small muted num" id="per-night" style="margin:-6px 0 12px"></div>`;
 
   app.innerHTML = bar(existing ? (kind === 'flight' ? 'Flight' : 'Hotel') : `New ${kind === 'flight' ? 'Flight' : 'Hotel'}`,
@@ -477,50 +634,74 @@ async function viewBooking(trip, kind, id, params) {
       <label class="toggle"><span>Booked</span><input type="checkbox" name="booked" ${draft.booked ? 'checked' : ''}></label>
       <label class="field" style="margin:0"><span>Notes</span><textarea name="notes" rows="2" style="min-height:0" placeholder="Confirmation #, seat, etc.">${esc(draft.notes)}</textarea></label>
     </div>
-    <div class="card receipt"><h2>Receipt</h2><div id="receipt"></div>
-      <div class="row-btns" style="margin-bottom:0">
-        <label class="btn secondary"><span id="receipt-btn">${draft.receipt ? 'Replace' : 'Add screenshot'}</span><input type="file" accept="image/*" hidden id="receipt-input"></label>
-        ${draft.receipt ? '<button class="btn danger" data-act="rm-receipt">Remove</button>' : ''}
-      </div>
+    <div class="card"><h2>Files</h2><div id="files" class="files"></div>
+      <label class="btn secondary block" style="margin-top:10px"><span id="file-btn">+ Add files</span><input type="file" multiple hidden id="file-input"></label>
     </div>
     ${existing ? `<button class="btn danger block" data-act="delete">Delete ${kind}</button>` : ''}`;
 
-  const showReceipt = async () => {
-    const url = await imageUrl(draft.receipt);
-    $('#receipt').innerHTML = url ? `<img src="${url}" alt="Receipt">` : '<div class="muted small" style="margin-bottom:8px">No receipt saved.</div>';
-    const img = $('#receipt img'); if (img) img.onclick = () => openViewer(url);
+  const showFiles = async () => {
+    const box = $('#files');
+    if (!draft.files.length) { box.innerHTML = '<div class="muted small">No files yet. Add receipts, confirmations, PDFs, screenshots…</div>'; return; }
+    const urls = await Promise.all(draft.files.map(f => f.type.startsWith('image/') ? fileUrl(f.id) : null));
+    box.innerHTML = draft.files.map((f, i) => `
+      <div class="file" data-i="${i}">
+        ${urls[i] ? `<img src="${urls[i]}" alt="">` : `<span class="file-icon">${f.type === 'application/pdf' ? 'PDF' : 'FILE'}</span>`}
+        <span class="file-name">${esc(f.name)}<small>${fmtSize(f.size)}</small></span>
+        <button class="del" data-rm="${i}" aria-label="Remove file">×</button>
+      </div>`).join('');
   };
-  showReceipt();
+  showFiles();
+  $('#files').onclick = e => {
+    const row = e.target.closest('.file'); if (!row) return;
+    if (e.target.dataset.rm != null) { draft.files.splice(+e.target.dataset.rm, 1); showFiles(); }
+    else openViewer(draft.files[+row.dataset.i]);
+  };
 
+  const curSel = $('#price-cur');
+  let rate = draft.fx?.rate ?? 1; // trip-currency per 1 unit of the selected currency
+  const tripPrice = () => num($('[name=price]').value) * (curSel.value === trip.currency ? 1 : rate);
   const perNight = () => {
     const el = $('#per-night'); if (!el) return;
     const ci = $('[name=checkIn]').value, co = $('[name=checkOut]').value;
-    el.textContent = ci && co && co > ci ? `${nights({ checkIn: ci, checkOut: co })} nights · ${money(num($('[name=price]').value) / daysBetween(ci, co), trip.currency)} / night` : '';
+    el.textContent = ci && co && co > ci ? `${daysBetween(ci, co)} night${daysBetween(ci, co) === 1 ? '' : 's'} · ${money(tripPrice() / daysBetween(ci, co), trip.currency)} / night` : '';
   };
-  perNight();
-  app.addEventListener('input', perNight);
+  const updateFx = () => {
+    $('#fx-note').innerHTML = curSel.value === trip.currency ? ''
+      : `= ${money(tripPrice(), trip.currency)} · 1 ${curSel.value} = ${fmtRate(rate)} ${trip.currency} · <button type="button" class="link small" id="edit-rate">Edit rate</button>`;
+    perNight();
+  };
+  updateFx();
+  app.addEventListener('input', updateFx);
+  let lastCur = curSel.value;
+  curSel.onchange = async () => {
+    const r = await rateFor(curSel.value, trip.currency);
+    if (!r) { curSel.value = lastCur; return; }
+    rate = r; lastCur = curSel.value;
+    updateFx();
+  };
+  $('#fx-note').onclick = e => {
+    if (e.target.id !== 'edit-rate') return;
+    const r = num(prompt(`1 ${curSel.value} = how many ${trip.currency}?`, fmtRate(rate)) ?? '');
+    if (r > 0) { rate = r; updateFx(); }
+  };
   $('[name=checkIn]')?.addEventListener('change', e => {
     const co = $('[name=checkOut]');
     if (!co.value || co.value <= e.target.value) co.value = addDays(e.target.value, 1);
     perNight();
   });
 
-  $('#receipt-input').onchange = async e => {
-    const file = e.target.files[0]; if (!file) return;
-    $('#receipt-btn').textContent = 'Saving…';
-    try {
-      const rec = await compressImage(file);
-      const imgId = uid();
-      await idb.putImg(imgId, rec);
-      draft.receipt = imgId;
-      $('#receipt-btn').textContent = 'Replace';
-      showReceipt();
-    } catch (err) {
-      alert('Could not read that image.');
-      $('#receipt-btn').textContent = draft.receipt ? 'Replace' : 'Add screenshot';
+  $('#file-input').onchange = async e => {
+    const picked = [...e.target.files];
+    e.target.value = '';
+    const big = picked.filter(f => f.size > 25 * 1048576 && !f.type.startsWith('image/'));
+    if (big.length && !confirm(`${big.map(f => f.name).join(', ')} ${big.length === 1 ? 'is' : 'are'} over 25 MB and will use a lot of phone storage. Add anyway?`)) return;
+    $('#file-btn').textContent = 'Saving…';
+    for (const f of picked) {
+      try { draft.files.push(await storeFile(f)); } catch { alert(`Could not save ${f.name}.`); }
     }
+    $('#file-btn').textContent = '+ Add files';
+    showFiles();
   };
-  $('[data-act=rm-receipt]')?.addEventListener('click', () => { draft.receipt = null; showReceipt(); });
 
   $('[data-act=save]').onclick = async () => {
     for (const el of $$('[name]', app)) {
@@ -528,7 +709,12 @@ async function viewBooking(trip, kind, id, params) {
       draft[el.name] = el.type === 'checkbox' ? el.checked : el.name === 'price' ? num(el.value) : el.value.trim();
     }
     if (kind === 'hotel' && draft.checkIn && draft.checkOut && draft.checkOut <= draft.checkIn) return alert('Check-out must be after check-in.');
-    if (existing) Object.assign(existing, draft); else list.push(draft);
+    setMoney(draft, 'price', draft.price, curSel.value, trip.currency, rate);
+    if (curSel.value !== trip.currency) rememberCur(trip, curSel.value);
+    if (existing) {
+      for (const k of Object.keys(existing)) if (!(k in draft)) delete existing[k];
+      Object.assign(existing, draft);
+    } else list.push(draft);
     await saveNow(trip);
     cleanupImages();
     location.replace('#' + backTo);
@@ -542,11 +728,23 @@ async function viewBooking(trip, kind, id, params) {
   });
 }
 
-function openViewer(url) {
-  const v = $('#viewer');
-  $('img', v).src = url;
+async function openViewer(f) {
+  const url = await fileUrl(f.id);
+  if (!url) return alert('That file is missing.');
+  const v = $('#viewer'), body = $('.viewer-body', v);
+  $('.viewer-name', v).textContent = f.name;
+  body.innerHTML = f.type.startsWith('image/') ? `<img src="${url}" alt="">`
+    : f.type === 'application/pdf' ? `<iframe src="${url}" title="${esc(f.name)}"></iframe>`
+    : '<div class="empty">No preview for this file type.<br>Tap Share to open it in another app.</div>';
   v.hidden = false;
-  v.onclick = () => { v.hidden = true; };
+  $('[data-v=close]', v).onclick = () => { v.hidden = true; body.innerHTML = ''; };
+  $('[data-v=share]', v).onclick = async () => {
+    const rec = await idb.img(f.id);
+    const file = new File([rec.buf], f.name, { type: rec.type });
+    if (navigator.canShare?.({ files: [file] })) return navigator.share({ files: [file] }).catch(() => {});
+    const a = document.createElement('a');
+    a.href = url; a.download = f.name; a.click();
+  };
 }
 
 /* ================= Router ================= */
@@ -580,7 +778,9 @@ window.addEventListener('hashchange', render);
 (async function init() {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   navigator.storage?.persist?.();
-  trips = await idb.trips();
+  trips = (await idb.trips()).map(migrate);
   render();
   cleanupImages();
+  // Rates arrive after first paint; redraw the home screen so its "updated" line is current.
+  refreshRates().then(() => { if (!location.hash.slice(1)) render(); });
 })();
