@@ -1,0 +1,16 @@
+[project]
+name = "trip-budget"
+version = "0.1.0"
+description = "Travel budget tracker: iPhone web app plus a Mac version that syncs to it"
+authors = [
+    { name = "Robert Sanders", email = "rsanders81800@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "cryptography>=46",
+    "keyring>=25",
+]
+
+# Not an installable package -- `mac_app.py` is run directly as a script.
+[tool.uv]
+package = false

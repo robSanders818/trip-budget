@@ -25,7 +25,7 @@ async function tx(store, mode, fn) {
     t.onerror = () => reject(t.error);
   });
 }
-const idb = {
+const browserStore = {
   trips: () => tx('trips', 'readonly', s => s.getAll()),
   putTrip: trip => tx('trips', 'readwrite', s => s.put(trip)),
   delTrip: id => tx('trips', 'readwrite', s => s.delete(id)),
@@ -37,20 +37,56 @@ const idb = {
   putSetting: (key, val) => tx('settings', 'readwrite', s => s.put(val, key)),
 };
 
+// Mac version (`uv run mac_app.py` sets TB_DESKTOP): same interface, but everything is saved
+// as files under data/ by the local server instead of in the browser.
+const DESKTOP = !!window.TB_DESKTOP;
+async function api(method, path, body, type) {
+  const res = await fetch('api/' + path, {
+    method, body,
+    headers: body == null ? {} : { 'Content-Type': type || 'application/json' },
+    keepalive: typeof body === 'string' && body.length < 60000, // lets the last save finish if the tab closes
+  });
+  if (!res.ok && res.status !== 404) throw new Error(`${method} ${path} failed (${res.status})`);
+  return res;
+}
+const fileStore = {
+  trips: async () => (await api('GET', 'trips')).json(),
+  putTrip: trip => api('PUT', 'trips/' + trip.id, JSON.stringify(trip)),
+  delTrip: id => api('DELETE', 'trips/' + id),
+  img: async id => {
+    const r = await api('GET', 'files/' + id);
+    return r.ok ? { type: r.headers.get('Content-Type'), buf: await r.arrayBuffer() } : undefined;
+  },
+  putImg: (id, val) => api('PUT', 'files/' + id, val.buf, val.type),
+  delImg: id => api('DELETE', 'files/' + id),
+  imgKeys: async () => (await api('GET', 'files')).json(),
+  setting: async key => { const r = await api('GET', 'settings/' + key); return r.ok ? r.json() : undefined; },
+  putSetting: (key, val) => api('PUT', 'settings/' + key, JSON.stringify(val)),
+};
+const idb = DESKTOP ? fileStore : browserStore;
+
 let trips = [];
 const saveTimers = {};
+// Every edit stamps `updated`; syncing keeps whichever copy of a trip was edited last.
 function save(trip, delay = 400) {
+  trip.updated = Date.now();
   clearTimeout(saveTimers[trip.id]);
-  saveTimers[trip.id] = setTimeout(() => idb.putTrip(trip), delay);
+  saveTimers[trip.id] = setTimeout(() => { delete saveTimers[trip.id]; idb.putTrip(trip); }, delay);
 }
 function saveNow(trip) {
+  trip.updated = Date.now();
   clearTimeout(saveTimers[trip.id]);
+  delete saveTimers[trip.id];
   return idb.putTrip(trip);
 }
 // Flush pending saves when the app is backgrounded/closed.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') {
-    for (const id in saveTimers) { const t = trips.find(x => x.id === id); if (t) saveNow(t); }
+  if (document.visibilityState !== 'hidden') return;
+  for (const id in saveTimers) {
+    clearTimeout(saveTimers[id]);
+    delete saveTimers[id];
+    const t = trips.find(x => x.id === id);
+    if (t) idb.putTrip(t);
   }
 });
 
@@ -351,20 +387,93 @@ async function exportBackup() {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
+const gunzip = buf => new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+
 async function importBackup(file) {
   let buf = await file.arrayBuffer();
   const head = new Uint8Array(buf.slice(0, 2));
-  if (head[0] === 0x1f && head[1] === 0x8b) {
-    buf = await new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
-  }
+  if (head[0] === 0x1f && head[1] === 0x8b) buf = await gunzip(buf);
   const data = JSON.parse(new TextDecoder().decode(buf));
+  const n = data.trips?.length ?? 0;
+  if (!confirm(`Import ${n} trip${n === 1 ? '' : 's'}? Where a trip is on both, the more recently edited copy is kept.`)) return;
+  const { added, replaced, kept } = await importData(data);
+  alert(importSummary(added, replaced, kept));
+}
+
+// Merge a backup/sync bundle: for trips on both sides, keep whichever was edited last.
+async function importData(data) {
   if (data.app !== 'tripbudget' || !Array.isArray(data.trips)) throw new Error('Not a Trip Budget backup');
-  if (!confirm(`Import ${data.trips.length} trip(s)? Trips with the same ID will be replaced.`)) return;
-  for (const [k, v] of Object.entries(data.images || {})) await idb.putImg(k, { type: v.type, buf: fromB64(v.data) });
-  for (const t of data.trips) await idb.putTrip(migrate(t));
+  let added = 0, replaced = 0, kept = 0;
+  const take = [];
+  for (const t of data.trips.map(migrate)) {
+    const mine = trips.find(x => x.id === t.id);
+    if (!mine) added++;
+    else if ((t.updated || 0) >= (mine.updated || 0)) replaced++;
+    else { kept++; continue; }
+    take.push(t);
+  }
+  const needed = new Set(take.flatMap(t => [...t.flights, ...t.hotels].flatMap(b => (b.files || []).map(f => f.id))));
+  for (const [k, v] of Object.entries(data.images || {})) if (needed.has(k)) await idb.putImg(k, { type: v.type, buf: fromB64(v.data) });
+  for (const t of take) await idb.putTrip(t);
   if (data.currencies?.length) { myCurrencies = [...new Set([...myCurrencies, ...data.currencies])]; await saveMyCurrencies(); }
-  trips = await idb.trips();
+  trips = (await idb.trips()).map(migrate);
+  await cleanupImages();
   render();
+  return { added, replaced, kept };
+}
+const importSummary = (added, replaced, kept) => [
+  added && `${added} new trip${added === 1 ? '' : 's'} added`,
+  replaced && `${replaced} trip${replaced === 1 ? '' : 's'} updated`,
+  kept && `${kept} trip${kept === 1 ? '' : 's'} kept as-is (edited more recently here)`,
+].filter(Boolean).join(' · ') || 'Nothing to import.';
+
+/* ================= Phone ⇄ Mac sync ================= */
+
+// The Mac app pushes sync/trip-budget.sync: "TBS1" | salt(16) | iv(12) | AES-256-GCM(gzip(json)),
+// keyed from your passphrase with PBKDF2-SHA256. It's in a public repo, so it is always encrypted.
+const SYNC_URL = 'sync/trip-budget.sync';
+const SYNC_ITERATIONS = 310000; // must match PBKDF2_ITERATIONS in mac_app.py
+
+async function decryptSync(buf, passphrase) {
+  const b = new Uint8Array(buf);
+  if (new TextDecoder().decode(b.slice(0, 4)) !== 'TBS1') throw new Error('That isn’t a Trip Budget sync file.');
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: b.slice(4, 20), iterations: SYNC_ITERATIONS, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+  const gz = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b.slice(20, 32) }, key, b.slice(32));
+  return JSON.parse(new TextDecoder().decode(await gunzip(gz)));
+}
+
+async function pullFromMac() {
+  const res = await fetch(SYNC_URL, { cache: 'no-store' }).catch(() => null);
+  if (!res) throw new Error('Couldn’t reach GitHub. Check your connection and try again.');
+  if (res.status === 404) throw new Error('Nothing to sync yet. Press “Save for phone” in the Mac app first.');
+  if (!res.ok) throw new Error(`Couldn’t download the sync file (${res.status}).`);
+  const buf = await res.arrayBuffer();
+  let pass = await idb.setting('syncPass');
+  while (true) {
+    pass ||= prompt('Sync passphrase (the one you chose in the Mac app):');
+    if (!pass) return null;
+    try {
+      const data = await decryptSync(buf, pass);
+      await idb.putSetting('syncPass', pass);
+      return importData(data);
+    } catch (e) {
+      if (e.name !== 'OperationError') throw e;
+      alert('That passphrase didn’t work. Try again.');
+      pass = null;
+    }
+  }
+}
+
+async function pushFromMac(passphrase) {
+  const res = await fetch('api/sync/push', { method: 'POST', body: JSON.stringify({ passphrase }) });
+  const out = await res.json();
+  if (res.status === 409 && out.need === 'passphrase') {
+    const p = prompt('Choose a sync passphrase.\nYou’ll type it once on your phone. Anyone with it could read your synced trips, so make it hard to guess.');
+    return p?.trim() ? pushFromMac(p.trim()) : null;
+  }
+  return out;
 }
 
 /* ================= Views ================= */
@@ -392,9 +501,24 @@ function viewHome() {
       <div id="cur-results" class="cur-results"></div>
       <div class="small muted" id="rates-info" style="margin-top:8px"></div>
     </div>
+    ${DESKTOP ? `
+    <div class="card">
+      <h2>Sync to phone <button class="link" data-act="new-pass">Change passphrase</button></h2>
+      <p class="small muted" style="margin-top:0">Encrypts everything and pushes it to GitHub. Then tap “Sync from Mac” on your phone.</p>
+      <button class="btn block" data-act="push">Save for phone</button>
+      <div class="small muted" id="sync-info" style="margin-top:8px"></div>
+    </div>` : `
+    <div class="card">
+      <h2>Sync from Mac</h2>
+      <p class="small muted" style="margin-top:0">Loads what you last saved with “Save for phone” in the Mac app. Trips edited more recently on this phone are kept.</p>
+      <button class="btn block" data-act="pull">Sync from Mac</button>
+      <div class="small muted" id="sync-info" style="margin-top:8px"></div>
+    </div>`}
     <div class="card">
       <h2>Backup</h2>
-      <p class="small muted" style="margin-top:0">Everything is stored only on this phone. Export a backup to Files or iCloud Drive now and then. Deleting the app from your Home Screen erases its data.</p>
+      <p class="small muted" style="margin-top:0">${DESKTOP
+        ? 'Your trips and files are saved in the data folder next to mac_app.py. Import a phone backup here to bring phone edits to the Mac.'
+        : 'Everything is stored only on this phone. Export a backup to Files or iCloud Drive now and then. Deleting the app from your Home Screen erases its data.'}</p>
       <div class="row-btns">
         <button class="btn secondary" data-act="export">Export backup</button>
         <label class="btn secondary">Import<input type="file" accept=".gz,.json,application/json,application/gzip" hidden data-act="import"></label>
@@ -441,10 +565,40 @@ function viewHome() {
     if (rates?.fetched === before) alert('Couldn\'t reach the exchange rate service. Using saved rates.');
     showRates();
   };
-  navigator.storage?.estimate?.().then(e => {
+  if (!DESKTOP) navigator.storage?.estimate?.().then(e => {
     const el = $('#usage'); if (el && e.usage != null) el.textContent = `Using ${(e.usage / 1048576).toFixed(1)} MB on this device`;
   });
   $('[data-act=export]').onclick = () => exportBackup().catch(e => alert('Export failed: ' + e.message));
+  const syncInfo = $('#sync-info');
+  const busy = async (btn, label, fn) => {
+    const text = btn.textContent;
+    btn.disabled = true; btn.textContent = label;
+    try { await fn(); } catch (e) { syncInfo.textContent = e.message; } finally { btn.disabled = false; btn.textContent = text; }
+  };
+  if (DESKTOP) {
+    const showStatus = () => api('GET', 'sync/status').then(r => r.json()).then(st => {
+      syncInfo.textContent = st.lastSaved ? `Last saved for phone ${new Date(st.lastSaved).toLocaleString()}` : 'Not saved for phone yet.';
+    }).catch(() => {});
+    showStatus();
+    $('[data-act=push]').onclick = e => busy(e.target, 'Encrypting and pushing…', async () => {
+      const out = await pushFromMac();
+      if (!out) return;
+      syncInfo.textContent = out.message;
+      if (!out.ok && out.log) console.warn(out.log);
+      if (!out.ok) alert(out.message + '\n\n' + (out.log || ''));
+    });
+    $('[data-act=new-pass]').onclick = e => busy(e.target, 'Saving…', async () => {
+      const p = prompt('New sync passphrase. Your phone will ask for it on its next sync.');
+      if (!p?.trim()) return;
+      const out = await pushFromMac(p.trim());
+      if (out) syncInfo.textContent = out.ok ? 'Passphrase changed. ' + out.message : out.message;
+    });
+  } else {
+    $('[data-act=pull]').onclick = e => busy(e.target, 'Syncing…', async () => {
+      const r = await pullFromMac();
+      if (r) alert(importSummary(r.added, r.replaced, r.kept));
+    });
+  }
   $('[data-act=import]').onchange = e => { const f = e.target.files[0]; if (f) importBackup(f).catch(err => alert('Import failed: ' + err.message)); };
 }
 
@@ -899,7 +1053,7 @@ function render() {
 window.addEventListener('hashchange', render);
 
 (async function init() {
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if (!DESKTOP && 'serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   navigator.storage?.persist?.();
   trips = (await idb.trips()).map(migrate);
   await loadMyCurrencies();

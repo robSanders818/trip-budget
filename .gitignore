@@ -1,1 +1,5 @@
 .DS_Store
+# Mac app data: your trips and receipts. Never commit this; the repo is public.
+data/
+.venv/
+__pycache__/
