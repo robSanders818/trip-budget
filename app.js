@@ -114,9 +114,9 @@ function money(v, cur = 'USD', cents = true) {
   fmtCache[key] ??= new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, minimumFractionDigits: cents ? undefined : 0, maximumFractionDigits: cents ? undefined : 0 });
   return fmtCache[key].format(v);
 }
-// Compact amount for narrow grid cells: $84, $1.2k, $12k
-function short(v, cur) {
-  if (!v) return '–';
+// Compact amount for narrow grid cells: $84, $1.2k, $12k. `has` shows $0 (not –) when items exist.
+function short(v, cur, has = false) {
+  if (!v) return has ? money(0, cur, false) : '–';
   if (Math.abs(v) < 1000) return money(v, cur, false);
   const k = v / 1000;
   return money(Math.abs(k) >= 10 ? Math.round(k) : Math.round(k * 10) / 10, cur, Math.abs(k) < 10).replace(/\.00$|(\.\d)0$/, '$1') + 'k';
@@ -275,8 +275,10 @@ const nights = h => Math.max(1, daysBetween(h.checkIn, h.checkOut));
 function hotelsOn(trip, date) {
   return trip.hotels.filter(h => h.checkIn && h.checkOut && date >= h.checkIn && date < h.checkOut);
 }
+// "2nd leg" flights sort after every other flight that day, whatever their times say.
+const flightKey = f => (f.date || '9999') + (f.leg2 ? '1' : '0') + (f.depart || '');
 function flightsOn(trip, date) {
-  return trip.flights.filter(f => f.date === date);
+  return trip.flights.filter(f => f.date === date).sort((a, b) => flightKey(a).localeCompare(flightKey(b)));
 }
 
 // Per-day totals for every category. Hotel cost is spread evenly across its nights.
@@ -292,9 +294,14 @@ function computeRows(trip) {
       flightTodo: fl.some(f => !f.booked), flightOk: fl.length > 0 && fl.every(f => f.booked),
       hotelTodo: ho.some(h => !h.booked), hotelOk: ho.length > 0 && ho.every(h => h.booked),
       noHotel: ho.length === 0 && i < all.length - 1,
+      has: { flights: fl.length > 0, hotel: ho.length > 0 },
     };
-    for (const c of LIST_CATS) row[c.key] = sum((day[c.key] || []).map(it => it.amount));
+    for (const c of LIST_CATS) {
+      row[c.key] = sum((day[c.key] || []).map(it => it.amount));
+      row.has[c.key] = (day[c.key] || []).length > 0;
+    }
     row.total = sum(CATS.map(c => row[c.key]));
+    row.has.total = CATS.some(c => row.has[c.key]);
     return row;
   });
 }
@@ -305,13 +312,18 @@ function tripTotals(trip) {
   };
   for (const c of LIST_CATS) t[c.key] = sum(Object.values(trip.days).flatMap(d => (d[c.key] || []).map(i => i.amount)));
   t.total = sum(CATS.map(c => t[c.key]));
+  t.has = {
+    flights: trip.flights.length > 0, hotel: trip.hotels.length > 0,
+    ...Object.fromEntries(LIST_CATS.map(c => [c.key, Object.values(trip.days).some(d => (d[c.key] || []).length > 0)])),
+  };
   return t;
 }
 
 // Green (cheap) → red (priciest) relative to the other days in the same column.
-function heat(v, max) {
-  if (!v || !max) return '';
-  const r = Math.min(1, v / max);
+// `has` colors a $0 cell that has items as the cheapest (green) shade.
+function heat(v, max, has = false) {
+  if (!v && !has) return '';
+  const r = max ? Math.min(1, Math.max(0, v / max)) : 0;
   const hue = Math.round(140 - 140 * r);
   return `background:hsl(${hue} 75% var(--heat-l) / calc(var(--heat-a0) + (var(--heat-a1) - var(--heat-a0)) * ${r.toFixed(2)}))`;
 }
@@ -662,8 +674,8 @@ function viewTrip(trip) {
     let mark = '';
     if (k === 'flights') mark = r.flightTodo ? '<i class="mark todo">●</i>' : r.flightOk ? '<i class="mark ok">✓</i>' : '';
     if (k === 'hotel') mark = r.hotelTodo ? '<i class="mark todo">●</i>' : r.hotelOk ? '<i class="mark ok">✓</i>' : '';
-    const cls = [v ? '' : 'zero', k === 'hotel' && r.noHotel ? 'gap' : '', k === 'total' ? 'total' : ''].filter(Boolean).join(' ');
-    return `<td class="${cls}" style="${heat(v, max[k])}" data-day="${r.date}">${short(v, cur)}${mark}</td>`;
+    const cls = [v || r.has[k] ? '' : 'zero', k === 'hotel' && r.noHotel ? 'gap' : '', k === 'total' ? 'total' : ''].filter(Boolean).join(' ');
+    return `<td class="${cls}" style="${heat(v, max[k], r.has[k])}" data-day="${r.date}">${short(v, cur, r.has[k])}${mark}</td>`;
   };
 
   app.innerHTML = bar(trip.name || 'Untitled trip', back('', '‹ Trips'), back(`trip/${trip.id}/edit`, 'Edit')) + `
@@ -675,7 +687,7 @@ function viewTrip(trip) {
         <div class="small muted num">${tot.total > trip.budget
           ? `${money(tot.total - trip.budget, cur)} over the ${money(trip.budget, cur, false)} budget`
           : `${money(trip.budget - tot.total, cur)} left of ${money(trip.budget, cur, false)}`}</div>` : ''}
-      <div class="cat-totals">${CATS.map(c => `<div><b class="num">${short(tot[c.key], cur)}</b>${c.head}</div>`).join('')}</div>
+      <div class="cat-totals">${CATS.map(c => `<div><b class="num">${short(tot[c.key], cur, tot.has[c.key])}</b>${c.head}</div>`).join('')}</div>
     </div>
     <div class="row-btns">
       <a class="btn secondary" href="#trip/${trip.id}/flight/new">+ Flight</a>
@@ -688,7 +700,7 @@ function viewTrip(trip) {
         <td class="day" data-day="${r.date}"><b>${dayLabel(r.date)}</b><span>${esc(r.city) || '&nbsp;'}</span></td>
         ${cols.map(k => cell(r, k)).join('')}
       </tr>`).join('')}</tbody>
-      <tfoot><tr><td class="day">Total</td>${cols.map(k => `<td class="num">${short(sum(rows.map(r => r[k])), cur)}</td>`).join('')}</tr></tfoot>
+      <tfoot><tr><td class="day">Total</td>${cols.map(k => `<td class="num">${short(sum(rows.map(r => r[k])), cur, rows.some(r => r.has[k]))}</td>`).join('')}</tr></tfoot>
     </table>
     <div class="legend"><span>Cheaper</span><span class="ramp"></span><span>Pricier (vs. other days)</span>
       <span>· <span style="color:var(--accent)">✓</span> booked · <span style="color:var(--warn)">●</span> not booked</span></div>
@@ -698,6 +710,9 @@ function viewTrip(trip) {
   app.querySelectorAll('tbody td').forEach(td => td.onclick = () => { location.hash = `#trip/${trip.id}/day/${td.dataset.day}`; });
 }
 
+// "14:05" -> "2:05 PM" in the phone's own style.
+const fmtTime = t => t ? new Date(`2000-01-01T${t}`).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }) : '';
+const flightTimes = f => f.depart || f.arrive ? [fmtTime(f.depart) || '?', fmtTime(f.arrive)].filter(Boolean).join(' → ') : '';
 const origLine = o => o.fx ? `<small>${money(o.fx.amt, o.fx.cur)}</small>` : '';
 const clip = b => b.files?.length ? ` <span class="muted small">📎${b.files.length}</span>` : '';
 function bookingRow(trip, b, kind) {
@@ -706,7 +721,7 @@ function bookingRow(trip, b, kind) {
     const route = [b.from, b.to].filter(Boolean).join(' → ');
     return `<a class="booking" href="#trip/${trip.id}/flight/${b.id}">
       <div class="what"><b>✈︎ ${esc([b.airline, b.number].filter(Boolean).join(' ') || 'Flight')}${clip(b)}</b>
-      <span>${esc(route)}${route ? ' · ' : ''}${b.date ? dayLabel(b.date) : 'No date'}</span></div>
+      <span>${esc(route)}${route ? ' · ' : ''}${b.date ? dayLabel(b.date) : 'No date'}${flightTimes(b) ? ` · ${flightTimes(b)}` : ''}${b.leg2 ? ' · 2nd leg' : ''}</span></div>
       <span class="num amt-col">${money(b.price || 0, cur)}${origLine(b)}</span>
       <span class="pill ${b.booked ? 'ok' : 'todo'}">${b.booked ? 'Booked' : 'To book'}</span></a>`;
   }
@@ -717,10 +732,54 @@ function bookingRow(trip, b, kind) {
     <span class="pill ${b.booked ? 'ok' : 'todo'}">${b.booked ? 'Booked' : 'To book'}</span></a>`;
 }
 
+// Hotel colors cycle through these hues; flights always use the accent color.
+const HOTEL_HUES = [215, 280, 25, 330, 150, 50, 190, 0];
+
+// Week-by-week calendar of the trip (Sunday first). Hotels are bars across their nights,
+// each hotel its own color; flights are chips. Faded = not booked yet.
+function bookingCalendar(trip, hotels) {
+  const color = new Map(hotels.map((h, i) => [h.id, HOTEL_HUES[i % HOTEL_HUES.length]]));
+  // Give each hotel a lane so overlapping stays sit on separate rows and bars line up.
+  const laneEnds = [], lane = new Map();
+  for (const h of hotels.filter(h => h.checkIn && h.checkOut)) {
+    let l = laneEnds.findIndex(end => end <= h.checkIn);
+    if (l < 0) l = laneEnds.length;
+    laneEnds[l] = h.checkOut; lane.set(h.id, l);
+  }
+  const first = addDays(trip.start, -toDate(trip.start).getUTCDay());
+  const weekdays = dateRange('2000-01-02', '2000-01-08').map(d => fmtDate(d, { weekday: 'narrow' }));
+  const cells = [];
+  for (let d = first; d <= trip.end || toDate(d).getUTCDay() !== 0; d = addDays(d, 1)) {
+    if (d < trip.start || d > trip.end) { cells.push('<div class="cal-day out"></div>'); continue; }
+    const label = d === trip.start || d.endsWith('-01') ? fmtDate(d, { month: 'short', day: 'numeric' }) : String(+d.slice(8));
+    const lanes = Array.from({ length: laneEnds.length }, () => '<div class="cal-bar empty"></div>');
+    for (const h of hotelsOn(trip, d)) {
+      const startCap = d === h.checkIn || d === trip.start || toDate(d).getUTCDay() === 0;
+      const last = addDays(h.checkOut, -1);
+      const endCap = d === last || d === trip.end || toDate(d).getUTCDay() === 6;
+      // The name sits in the first cell of each run but may stretch across the whole run.
+      const run = Math.min(daysBetween(d, last), daysBetween(d, trip.end), 6 - toDate(d).getUTCDay()) + 1;
+      const name = startCap ? `<span style="width:calc(${run * 100}% - 4px)">${esc(h.name || 'Hotel')}</span>` : '';
+      lanes[lane.get(h.id)] = `<div class="cal-bar${h.booked ? '' : ' todo'}${startCap ? ' s' : ''}${endCap ? ' e' : ''}" style="--h:${color.get(h.id)}">${name}</div>`;
+    }
+    const fl = flightsOn(trip, d);
+    cells.push(`<a class="cal-day" href="#trip/${trip.id}/day/${d}">
+      <span class="cal-num">${label}</span>
+      ${fl.map(f => `<span class="cal-fl${f.booked ? '' : ' todo'}">✈︎ ${esc(f.to || f.number || '')}</span>`).join('')}
+      <div class="cal-lanes">${lanes.join('')}</div></a>`);
+  }
+  return `<div class="card cal-card">
+    <div class="cal">${weekdays.map(w => `<div class="cal-head">${w}</div>`).join('')}${cells.join('')}</div>
+    <div class="legend">
+      <span><span class="cal-key fl">✈︎</span> Flight</span>
+      ${hotels.map(h => `<span><span class="cal-key" style="--h:${color.get(h.id)}"></span> ${esc(h.name || 'Hotel')}</span>`).join('')}
+    </div></div>`;
+}
+
 function viewBookings(trip) {
-  const fl = [...trip.flights].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  const fl = [...trip.flights].sort((a, b) => flightKey(a).localeCompare(flightKey(b)));
   const ho = [...trip.hotels].sort((a, b) => (a.checkIn || '').localeCompare(b.checkIn || ''));
-  app.innerHTML = bar('Bookings', back(`trip/${trip.id}`)) + `
+  app.innerHTML = bar('Bookings', back(`trip/${trip.id}`)) + bookingCalendar(trip, ho) + `
     <div class="card"><h2>Flights <a class="link" href="#trip/${trip.id}/flight/new">+ Add</a></h2>
       ${fl.map(f => bookingRow(trip, f, 'flight')).join('') || '<div class="muted small">No flights yet.</div>'}</div>
     <div class="card"><h2>Hotels <a class="link" href="#trip/${trip.id}/hotel/new">+ Add</a></h2>
@@ -843,6 +902,8 @@ async function viewBooking(trip, kind, id, params) {
       <div class="two">${field('airline', 'Airline', 'placeholder="e.g. United"')}${field('number', 'Flight #', 'placeholder="UA 837" autocapitalize="characters"')}</div>
       <div class="two">${field('from', 'From', 'placeholder="SFO" autocapitalize="characters"')}${field('to', 'To', 'placeholder="NRT" autocapitalize="characters"')}</div>
       ${field('date', 'Departure date', 'type="date"')}
+      <div class="two">${field('depart', 'Departs', 'type="time"')}${field('arrive', 'Arrives', 'type="time"')}</div>
+      <label class="toggle"><span>2nd leg <small class="muted">(list last on this date)</small></span><input type="checkbox" name="leg2" ${draft.leg2 ? 'checked' : ''}></label>
       ${priceField('Price')}`
     : `
       ${field('name', 'Hotel name', 'placeholder="e.g. Hotel Gracery"')}

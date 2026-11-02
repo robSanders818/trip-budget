@@ -11,6 +11,7 @@
   --heat-a0: .18;
   --heat-a1: .55;
   --radius: 12px;
+  --cal-l: 46%;
   color-scheme: light dark;
 }
 @media (prefers-color-scheme: dark) {
@@ -26,6 +27,7 @@
     --heat-l: 48%;
     --heat-a0: .25;
     --heat-a1: .7;
+    --cal-l: 40%;
   }
 }
 
@@ -91,9 +93,9 @@ label.field > span { display: block; font-size: 13px; color: var(--muted); margi
 .two > * { min-width: 0; }
 /* One fixed height for every single-line field so iOS date pickers can't grow taller or wider. */
 .field input, .field select { height: 42px; padding-top: 0; padding-bottom: 0; }
-input[type=date] { -webkit-appearance: none; appearance: none; display: block; width: 100%; min-width: 0; line-height: 40px; text-align: left; }
-input[type=date]::-webkit-date-and-time-value { text-align: left; margin: 0; padding: 0; line-height: 40px; }
-input[type=date]::-webkit-datetime-edit { padding: 0; }
+input[type=date], input[type=time] { -webkit-appearance: none; appearance: none; display: block; width: 100%; min-width: 0; line-height: 40px; text-align: left; }
+input[type=date]::-webkit-date-and-time-value, input[type=time]::-webkit-date-and-time-value { text-align: left; margin: 0; padding: 0; line-height: 40px; }
+input[type=date]::-webkit-datetime-edit, input[type=time]::-webkit-datetime-edit { padding: 0; }
 .toggle { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 12px; }
 .toggle input { width: 22px; height: 22px; accent-color: var(--accent); }
 
@@ -195,3 +197,24 @@ input[type=date]::-webkit-datetime-edit { padding: 0; }
 .cur-results { display: flex; flex-direction: column; margin-top: 4px; }
 .cur-results button { text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 10px 4px; font-size: 15px; cursor: pointer; }
 .cur-results button b { display: inline-block; width: 44px; color: var(--accent); }
+
+/* Bookings calendar */
+.cal-card { padding: 10px 8px; }
+.cal { display: grid; overflow: hidden; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.cal-head { text-align: center; font-size: 11px; font-weight: 600; color: var(--muted); padding-bottom: 4px; }
+.cal-day { display: flex; overflow: visible; flex-direction: column; gap: 2px; min-height: 58px; padding: 3px 0 4px; border-top: 1px solid var(--line); color: inherit; text-decoration: none; min-width: 0; }
+.cal-day.out { background: color-mix(in srgb, var(--line) 35%, transparent); }
+.cal-num { font-size: 11px; font-weight: 600; padding: 0 4px; white-space: nowrap; overflow: hidden; }
+.cal-fl { margin: 0 2px; padding: 1px 3px; border-radius: 4px; font-size: 10px; font-weight: 600; line-height: 1.3;
+  background: var(--accent); color: var(--card); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cal-lanes { display: flex; flex-direction: column; gap: 2px; margin-top: auto; }
+.cal-bar { position: relative; height: 15px; font-size: 9.5px; line-height: 15px; font-weight: 600; padding: 0 3px; white-space: nowrap;
+  background: hsl(var(--h) 65% var(--cal-l)); color: #fff; }
+.cal-bar span { position: absolute; left: 3px; top: 0; z-index: 1; overflow: hidden; text-overflow: ellipsis; }
+.cal-bar.empty { background: none; }
+.cal-bar.s { margin-left: 2px; border-top-left-radius: 5px; border-bottom-left-radius: 5px; }
+.cal-bar.e { margin-right: 2px; border-top-right-radius: 5px; border-bottom-right-radius: 5px; }
+.cal-fl.todo { opacity: .45; }
+.cal-bar.todo { background: hsl(var(--h) 65% var(--cal-l) / .35); color: var(--ink); }
+.cal-key { display: inline-block; width: 12px; height: 12px; border-radius: 3px; background: hsl(var(--h) 65% var(--cal-l)); vertical-align: -2px; }
+.cal-key.fl { width: auto; height: auto; padding: 0 3px; background: var(--accent); color: var(--card); font-size: 9px; line-height: 12px; }
